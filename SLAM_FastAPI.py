@@ -4,8 +4,8 @@
 import cv2
 import numpy as np
 import asyncio
-from fastapi import FastAPI, Response
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse, HTMLResponse
 import uvicorn
 
 # ================= CONFIG (from Slam_Working.py) =================
@@ -323,22 +323,37 @@ async def startup_event():
     """Start the video processing task on server startup."""
     asyncio.create_task(video_processing_loop())
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 async def root():
-    """Serves a simple HTML page to display the video stream."""
-    html_content = """
+    """Serves a simple HTML page to display the video stream and counts."""
+    occupied_count = sum(1 for s in bay_states.values() if s['status'] == 'Occupied')
+    empty_count = len(BAY_WORLD_MM) - occupied_count
+    
+    html_content = f"""
     <html>
         <head>
             <title>Real-time Parking Occupancy</title>
+            <style>
+                body {{ font-family: sans-serif; }}
+                .status-text {{ font-size: 24px; }}
+                .occupied {{ color: red; }}
+                .empty {{ color: green; }}
+            </style>
         </head>
         <body>
             <h1>Real-time Parking Occupancy</h1>
+            <div>
+                <span class="status-text">Occupied Spaces: <strong class="occupied">{occupied_count}</strong></span>
+            </div>
+            <div>
+                <span class="status-text">Empty Spaces: <strong class="empty">{empty_count}</strong></span>
+            </div>
             <p>API for status available at <a href="/status">/status</a>.</p>
             <img src="/video" width="100%">
         </body>
     </html>
     """
-    return Response(content=html_content, media_type="text/html")
+    return HTMLResponse(content=html_content)
 
 @app.get("/video")
 async def video_feed():
