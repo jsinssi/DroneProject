@@ -325,31 +325,170 @@ async def startup_event():
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    """Serves a simple HTML page to display the video stream and counts."""
+    """Serves a modern, user-friendly HTML page with auto-updating counts and a clock."""
+    # Initial counts for the first page load
     occupied_count = sum(1 for s in bay_states.values() if s['status'] == 'Occupied')
-    empty_count = len(BAY_WORLD_MM) - occupied_count
+    total_bays = len(BAY_WORLD_MM)
+    empty_count = total_bays - occupied_count
     
     html_content = f"""
-    <html>
+    <!DOCTYPE html>
+    <html lang="en">
         <head>
-            <title>Real-time Parking Occupancy</title>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>SkySpot SLAM Demo</title>
+            <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap" rel="stylesheet">
             <style>
-                body {{ font-family: sans-serif; }}
-                .status-text {{ font-size: 24px; }}
-                .occupied {{ color: red; }}
-                .empty {{ color: green; }}
+                body {{
+                    font-family: 'Roboto', sans-serif;
+                    background-color: #f0f2f5;
+                    color: #333;
+                    margin: 0;
+                    padding: 20px;
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                }}
+                header {{
+                    width: 100%;
+                    max-width: 1200px;
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    margin-bottom: 20px;
+                }}
+                header h1 {{
+                    color: #1d3557;
+                    margin: 0;
+                }}
+                #clock {{
+                    font-size: 22px;
+                    font-weight: 700;
+                    color: #457b9d;
+                    background-color: #fff;
+                    padding: 10px 20px;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                }}
+                main {{
+                    display: flex;
+                    gap: 20px;
+                    width: 100%;
+                    max-width: 1200px;
+                }}
+                .status-container {{
+                    background-color: #fff;
+                    padding: 20px;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                    flex-basis: 300px;
+                    flex-shrink: 0;
+                }}
+                .status-container h2 {{
+                    margin-top: 0;
+                    color: #1d3557;
+                    border-bottom: 2px solid #f1faee;
+                    padding-bottom: 10px;
+                }}
+                .status-item {{
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    font-size: 20px;
+                    margin-bottom: 15px;
+                }}
+                .status-item strong {{
+                    font-size: 28px;
+                }}
+                .occupied {{ color: #e63946; }}
+                .empty {{ color: #2a9d8f; }}
+                .video-container {{
+                    flex-grow: 1;
+                    background-color: #000;
+                    border-radius: 8px;
+                    overflow: hidden;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                }}
+                .video-container img {{
+                    width: 100%;
+                    display: block;
+                }}
+                footer {{
+                    margin-top: 20px;
+                    color: #6c757d;
+                }}
+                footer a {{
+                    color: #457b9d;
+                    text-decoration: none;
+                }}
+                footer a:hover {{
+                    text-decoration: underline;
+                }}
             </style>
         </head>
         <body>
-            <h1>Real-time Parking Occupancy</h1>
-            <div>
-                <span class="status-text">Occupied Spaces: <strong class="occupied">{occupied_count}</strong></span>
-            </div>
-            <div>
-                <span class="status-text">Empty Spaces: <strong class="empty">{empty_count}</strong></span>
-            </div>
-            <p>API for status available at <a href="/status">/status</a>.</p>
-            <img src="/video" width="100%">
+            <header>
+                <h1>SkySpot SLAM Demo</h1>
+                <div id="clock"></div>
+            </header>
+            <main>
+                <div class="status-container">
+                    <h2>Live Status</h2>
+                    <div class="status-item">
+                        <span>Occupied Spaces:</span>
+                        <strong id="occupied-count" class="occupied">{occupied_count}</strong>
+                    </div>
+                    <div class="status-item">
+                        <span>Empty Spaces:</span>
+                        <strong id="empty-count" class="empty">{empty_count}</strong>
+                    </div>
+                </div>
+                <div class="video-container">
+                    <img src="/video" alt="Live video feed">
+                </div>
+            </main>
+            <footer>
+                <p>API for raw data available at <a href="/status" target="_blank">/status</a>.</p>
+            </footer>
+
+            <script>
+                const totalBays = {total_bays};
+                const occupiedCountElement = document.getElementById('occupied-count');
+                const emptyCountElement = document.getElementById('empty-count');
+                const clockElement = document.getElementById('clock');
+
+                async function updateCounts() {{
+                    try {{
+                        const response = await fetch('/status');
+                        const data = await response.json();
+                        
+                        let occupiedCount = 0;
+                        for (const bayId in data) {{
+                            if (data[bayId].status === 'Occupied') {{
+                                occupiedCount++;
+                            }}
+                        }}
+                        
+                        const emptyCount = totalBays - occupiedCount;
+
+                        occupiedCountElement.textContent = occupiedCount;
+                        emptyCountElement.textContent = emptyCount;
+                    }} catch (error) {{
+                        console.error("Error fetching status:", error);
+                    }}
+                }}
+
+                function updateClock() {{
+                    const now = new Date();
+                    const timeString = now.toLocaleTimeString('en-US');
+                    clockElement.textContent = timeString;
+                }}
+
+                setInterval(updateCounts, 1000);
+                setInterval(updateClock, 1000);
+                updateClock(); // Initial call to display clock immediately
+            </script>
         </body>
     </html>
     """
