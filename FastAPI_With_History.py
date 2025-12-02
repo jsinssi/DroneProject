@@ -10,6 +10,7 @@ import uvicorn
 import sqlite3
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
+import time
 
 # ================= DATABASE CONFIG =================
 DATABASE_FILE = "parking_history.db"
@@ -35,7 +36,7 @@ def init_db():
 
 def _execute_add_history(bay_id, start_time_iso, end_time_iso, duration_seconds):
     """Synchronous function to be run in the executor."""
-    conn = sqlite3.connect(DATABASE_FILE)
+    conn = sqlite3.connect(DATABASE_FILE, timeout=10)
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO occupancy_history (bay_id, start_time, end_time, duration_seconds)
@@ -62,7 +63,7 @@ async def add_history_record(bay_id, start_time, end_time):
 
 def _execute_get_history():
     """Synchronous function to fetch history, to be run in the executor."""
-    conn = sqlite3.connect(DATABASE_FILE)
+    conn = sqlite3.connect(DATABASE_FILE, timeout=10)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM occupancy_history ORDER BY end_time DESC LIMIT 3")
@@ -291,10 +292,94 @@ latest_frame = None
 bay_states = {} # Current status for API
 occupancy_tracker = {} # For tracking start times and history logic
 
-async def video_processing_loop():
-    """The main video processing logic, adapted to run as a background task."""
+def process_frame(frame, kf_H):
+    """Synchronous function to process a single video frame."""
     global latest_frame, bay_states, occupancy_tracker
-    
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    H_raw, marker_corners, marker_ids = compute_homography_from_aruco(gray)
+
+    marker_boxes = []
+    if marker_ids is not None:
+        cv2.aruco.drawDetectedMarkers(frame, marker_corners, marker_ids)
+        for c in marker_corners:
+            x_m, y_m, w_m, h_m = cv2.boundingRect(c[0].astype(np.int32))
+            marker_boxes.append((x_m, y_m, w_m, h_m))
+
+    if H_raw is not None:
+        kf_H.update(H_raw)
+    else:
+        kf_H.predict()
+
+    H_used = kf_H.get_H()
+    if H_used is None:
+        H_used = H_raw
+
+    empty_rects_img = detect_parking_rectangles(gray, marker_boxes)
+    car_rects_img = detect_car_rectangles(hsv, marker_boxes)
+
+    current_bay_states = {}
+    if H_used is not None:
+        # Process empty bays first
+        for (x, y, w, h) in empty_rects_img:
+            cx, cy = x + w / 2.0, y + h / 2.0
+            wx, wy = image_to_world(H_used, (cx, cy))
+            bay_id = assign_to_bay(wx, wy)
+            if bay_id is not None:
+                current_bay_states[bay_id] = {'status': 'Empty', 'rect': (x, y, w, h)}
+
+        # Process occupied bays, potentially overwriting empty status
+        for (x, y, w, h) in car_rects_img:
+            cx, cy = x + w / 2.0, y + h / 2.0
+            wx, wy = image_to_world(H_used, (cx, cy))
+            bay_id = assign_to_bay(wx, wy)
+            if bay_id is not None:
+                current_bay_states[bay_id] = {'status': 'Occupied', 'rect': (x, y, w, h)}
+
+        # History logic: Compare current states with the tracker
+        now = datetime.now()
+        
+        # Check for newly occupied bays
+        for bay_id, state in current_bay_states.items():
+            if state['status'] == 'Occupied' and bay_id not in occupancy_tracker:
+                occupancy_tracker[bay_id] = {'status': 'Occupied', 'start_time': now}
+
+        # Check for newly empty bays
+        for bay_id, tracked_state in list(occupancy_tracker.items()):
+            if bay_id not in current_bay_states or current_bay_states[bay_id]['status'] == 'Empty':
+                # Run the async function in a new event loop for this thread
+                asyncio.run(add_history_record(bay_id, tracked_state['start_time'], now))
+                del occupancy_tracker[bay_id]
+
+        # Drawing logic
+        for bay_id, state in current_bay_states.items():
+            x, y, w, h = state['rect']
+            color = (0, 255, 0) if state['status'] == 'Empty' else (0, 0, 255)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+            cv2.putText(frame, f"Bay {bay_id}: {state['status']}", (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+    else:
+        # Fallback drawing if no homography
+        for (x, y, w, h) in empty_rects_img:
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        for (x, y, w, h) in car_rects_img:
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
+
+    occupied_count = sum(1 for s in current_bay_states.values() if s['status'] == 'Occupied')
+    empty_count = len(BAY_WORLD_MM) - occupied_count
+
+    cv2.putText(frame, f"Occupied: {occupied_count}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame, f"Empty: {empty_count}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+    bay_states = {k: {'status': v['status']} for k, v in current_bay_states.items()}
+    _, encoded_frame = cv2.imencode('.jpg', frame)
+    latest_frame = encoded_frame.tobytes()
+
+async def video_processing_loop():
+    """The main video processing logic, running CPU-bound tasks in an executor."""
+    loop = asyncio.get_running_loop()
     cap = cv2.VideoCapture("http://10.76.95.116:25236/video")
     if not cap.isOpened():
         print("Could not open camera")
@@ -303,94 +388,13 @@ async def video_processing_loop():
     kf_H = HomographyKalmanFilter(process_var=1e-4, meas_var=1e-2)
     
     while True:
-        ret, frame = cap.read()
+        ret, frame = await loop.run_in_executor(db_executor, cap.read)
         if not ret:
-            await asyncio.sleep(0.1) # Wait a bit before retrying
+            await asyncio.sleep(0.1)
             continue
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        H_raw, marker_corners, marker_ids = compute_homography_from_aruco(gray)
-
-        marker_boxes = []
-        if marker_ids is not None:
-            cv2.aruco.drawDetectedMarkers(frame, marker_corners, marker_ids)
-            for c in marker_corners:
-                x_m, y_m, w_m, h_m = cv2.boundingRect(c[0].astype(np.int32))
-                marker_boxes.append((x_m, y_m, w_m, h_m))
-
-        if H_raw is not None:
-            kf_H.update(H_raw)
-        else:
-            kf_H.predict()
-
-        H_used = kf_H.get_H()
-        if H_used is None:
-            H_used = H_raw
-
-        empty_rects_img = detect_parking_rectangles(gray, marker_boxes)
-        car_rects_img = detect_car_rectangles(hsv, marker_boxes)
-
-        current_bay_states = {}
-        if H_used is not None:
-            # Process empty bays first
-            for (x, y, w, h) in empty_rects_img:
-                cx, cy = x + w / 2.0, y + h / 2.0
-                wx, wy = image_to_world(H_used, (cx, cy))
-                bay_id = assign_to_bay(wx, wy)
-                if bay_id is not None:
-                    current_bay_states[bay_id] = {'status': 'Empty', 'rect': (x, y, w, h)}
-
-            # Process occupied bays, potentially overwriting empty status
-            for (x, y, w, h) in car_rects_img:
-                cx, cy = x + w / 2.0, y + h / 2.0
-                wx, wy = image_to_world(H_used, (cx, cy))
-                bay_id = assign_to_bay(wx, wy)
-                if bay_id is not None:
-                    current_bay_states[bay_id] = {'status': 'Occupied', 'rect': (x, y, w, h)}
-
-            # History logic: Compare current states with the tracker
-            now = datetime.now()
-            
-            # Check for newly occupied bays
-            for bay_id, state in current_bay_states.items():
-                if state['status'] == 'Occupied' and bay_id not in occupancy_tracker:
-                    occupancy_tracker[bay_id] = {'status': 'Occupied', 'start_time': now}
-
-            # Check for newly empty bays
-            for bay_id, tracked_state in list(occupancy_tracker.items()):
-                if bay_id not in current_bay_states or current_bay_states[bay_id]['status'] == 'Empty':
-                    # Fire and forget the async database write
-                    asyncio.create_task(add_history_record(bay_id, tracked_state['start_time'], now))
-                    del occupancy_tracker[bay_id]
-
-            # Drawing logic
-            for bay_id, state in current_bay_states.items():
-                x, y, w, h = state['rect']
-                color = (0, 255, 0) if state['status'] == 'Empty' else (0, 0, 255)
-                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-                cv2.putText(frame, f"Bay {bay_id}: {state['status']}", (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
-        else:
-            # Fallback drawing if no homography
-            for (x, y, w, h) in empty_rects_img:
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            for (x, y, w, h) in car_rects_img:
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-
-        occupied_count = sum(1 for s in current_bay_states.values() if s['status'] == 'Occupied')
-        empty_count = len(BAY_WORLD_MM) - occupied_count
-
-        cv2.putText(frame, f"Occupied: {occupied_count}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(frame, f"Empty: {empty_count}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-
-        # Update global state for APIs
-        bay_states = {k: {'status': v['status']} for k, v in current_bay_states.items()}
-        _, encoded_frame = cv2.imencode('.jpg', frame)
-        latest_frame = encoded_frame.tobytes()
         
-        await asyncio.sleep(0.01) # Yield control to the event loop
+        await loop.run_in_executor(db_executor, process_frame, frame, kf_H)
+        await asyncio.sleep(0.01) # Yield control briefly
 
 async def generate_video_stream():
     """Yields the latest processed frame for the streaming response."""
