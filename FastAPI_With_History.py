@@ -9,12 +9,16 @@ from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
 import uvicorn
 import sqlite3
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 
 # ================= DATABASE CONFIG =================
 DATABASE_FILE = "parking_history.db"
+# Use a thread pool for synchronous database operations to avoid blocking the event loop
+db_executor = ThreadPoolExecutor(max_workers=5)
 
 def init_db():
     """Initializes the SQLite database and creates the history table if it doesn't exist."""
+    # This is a quick, one-time operation, so running it synchronously at startup is acceptable.
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     cursor.execute("""
@@ -29,20 +33,42 @@ def init_db():
     conn.commit()
     conn.close()
 
-def add_history_record(bay_id, start_time, end_time):
-    """Adds a new occupancy record to the history database."""
-    duration = end_time - start_time
-    if duration.total_seconds() < 3:
-        return # Do not record if occupancy is less than 3 seconds
-
+def _execute_add_history(bay_id, start_time_iso, end_time_iso, duration_seconds):
+    """Synchronous function to be run in the executor."""
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO occupancy_history (bay_id, start_time, end_time, duration_seconds)
         VALUES (?, ?, ?, ?)
-    """, (bay_id, start_time.isoformat(), end_time.isoformat(), int(duration.total_seconds())))
+    """, (bay_id, start_time_iso, end_time_iso, duration_seconds))
     conn.commit()
     conn.close()
+
+async def add_history_record(bay_id, start_time, end_time):
+    """Adds a new occupancy record to the history database asynchronously."""
+    duration = end_time - start_time
+    if duration.total_seconds() < 3:
+        return # Do not record if occupancy is less than 3 seconds
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        db_executor, 
+        _execute_add_history, 
+        bay_id, 
+        start_time.isoformat(), 
+        end_time.isoformat(), 
+        int(duration.total_seconds())
+    )
+
+def _execute_get_history():
+    """Synchronous function to fetch history, to be run in the executor."""
+    conn = sqlite3.connect(DATABASE_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM occupancy_history ORDER BY end_time DESC LIMIT 3")
+    records = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in records]
 
 # ================= CONFIG (from Slam_Working.py) =================
 
@@ -335,7 +361,8 @@ async def video_processing_loop():
             # Check for newly empty bays
             for bay_id, tracked_state in list(occupancy_tracker.items()):
                 if bay_id not in current_bay_states or current_bay_states[bay_id]['status'] == 'Empty':
-                    add_history_record(bay_id, tracked_state['start_time'], now)
+                    # Fire and forget the async database write
+                    asyncio.create_task(add_history_record(bay_id, tracked_state['start_time'], now))
                     del occupancy_tracker[bay_id]
 
             # Drawing logic
@@ -633,14 +660,10 @@ async def get_status():
 
 @app.get("/history")
 async def get_history():
-    """Returns the last 10 occupancy history records."""
-    conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM occupancy_history ORDER BY end_time DESC LIMIT 10")
-    records = cursor.fetchall()
-    conn.close()
-    return JSONResponse(content=[dict(row) for row in records])
+    """Returns the last 3 occupancy history records asynchronously."""
+    loop = asyncio.get_running_loop()
+    records = await loop.run_in_executor(db_executor, _execute_get_history)
+    return JSONResponse(content=records)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
