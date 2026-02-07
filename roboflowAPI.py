@@ -1,3 +1,7 @@
+# 1. sudo apt-get install -y libavdevice-dev libavfilter-dev libopus-dev libvpx-dev pkg-config libsrtp2-dev libopencv-dev python3-opencv
+# 2. Create a Virtual Environment
+# 3. pip install opencv-python-headless numpy av inference-sdk aiortc
+# 4.run script
 import cv2
 import subprocess
 import numpy as np
